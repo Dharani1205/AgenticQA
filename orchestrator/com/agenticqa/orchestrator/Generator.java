@@ -85,6 +85,56 @@ public final class Generator {
 
         String slug = slugify(featurePrompt);
 
+        // Run the guard BEFORE writing anything. The guard can strip every method
+        // from the generated step class, and when it does the feature file must not
+        // be written either - otherwise the suite is left with scenarios that have
+        // no glue code and fails with UndefinedStepException.
+        String className = null;
+        Path stepsPath = null;
+        StepDefinitionGuard.Result guard = null;
+        if (steps != null && !steps.isBlank()) {
+            className = classNameOf(steps, slug + "Steps");
+            if (!containsPackage(steps)) {
+                steps = "package " + layout.stepsPackage + ";\n\n" + steps;
+            }
+            stepsPath = layout.testSourceRoot
+                    .resolve(layout.stepsPackage.replace('.', '/'))
+                    .resolve(className + ".java");
+
+            // Cucumber aborts the whole suite on a duplicate step expression, so
+            // drop any method that re-declares a step already in the repository.
+            guard = StepDefinitionGuard.dedupe(steps, layout, stepsPath);
+            if (guard.changed()) {
+                steps = guard.code;
+                if (guardNotes != null) {
+                    guardNotes.add(StepDefinitionGuard.describe(guard));
+                }
+            }
+        }
+
+        // The guard removed methods because they called fixture APIs the repository
+        // does not declare. Those steps cannot be implemented, so the feature that
+        // depends on them is not viable - refuse to write it rather than emit a
+        // feature file that is guaranteed to fail.
+        if (guard != null && !guard.removedInvalidMethods.isEmpty()) {
+            if (guardNotes != null) {
+                guardNotes.add("refused to write " + slug + ".feature - it depends on "
+                        + guard.removedInvalidMethods.size()
+                        + " step(s) that call APIs the repository does not provide: "
+                        + String.join(", ", guard.removedInvalidMethods));
+            }
+            return written;
+        }
+
+        // Nothing genuinely new left: the feature only reuses existing steps, so
+        // write the feature but no step class.
+        boolean stepsEmpty = steps == null || steps.isBlank()
+                || StepDefinitionGuard.stepExpressions(steps).isEmpty();
+        if (stepsEmpty && guard != null && guard.changed() && guardNotes != null) {
+            guardNotes.add("skipped " + className
+                    + ".java - every step it declared already exists in the repository");
+        }
+
         if (feature != null && !feature.isBlank()) {
             Files.createDirectories(layout.featureDir);
             Path p = layout.featureDir.resolve(slug + ".feature");
@@ -92,47 +142,20 @@ public final class Generator {
             written.add(p);
         }
 
-        if (steps != null && !steps.isBlank()) {
-            String className = classNameOf(steps, slug + "Steps");
-            if (!containsPackage(steps)) {
-                steps = "package " + layout.stepsPackage + ";\n\n" + steps;
-            }
-            Path p = layout.testSourceRoot
-                    .resolve(layout.stepsPackage.replace('.', '/'))
-                    .resolve(className + ".java");
-
-            // Cucumber aborts the whole suite on a duplicate step expression, so
-            // drop any method that re-declares a step already in the repository.
-            StepDefinitionGuard.Result guard = StepDefinitionGuard.dedupe(steps, layout, p);
-            if (guard.changed()) {
-                steps = guard.code;
-                if (guardNotes != null) {
-                    guardNotes.add(StepDefinitionGuard.describe(guard));
-                }
-            }
-
-            // Nothing genuinely new left: don't write an empty step class.
-            if (StepDefinitionGuard.stepExpressions(steps).isEmpty()) {
-                if (guardNotes != null) {
-                    guardNotes.add("skipped " + className
-                            + ".java - every step it declared already exists in the repository");
-                }
-                return written;
-            }
-
-            Files.createDirectories(p.getParent());
-            Files.write(p, steps.getBytes(StandardCharsets.UTF_8));
-            written.add(p);
+        if (!stepsEmpty) {
+            Files.createDirectories(stepsPath.getParent());
+            Files.write(stepsPath, steps.getBytes(StandardCharsets.UTF_8));
+            written.add(stepsPath);
         }
 
         if (runner != null && !runner.isBlank() && !runner.trim().equalsIgnoreCase("NONE")) {
-            String className = classNameOf(runner, slug + "Runner");
+            String runnerClassName = classNameOf(runner, slug + "Runner");
             if (!containsPackage(runner)) {
                 runner = "package " + layout.runnerPackage + ";\n\n" + runner;
             }
             Path p = layout.testSourceRoot
                     .resolve(layout.runnerPackage.replace('.', '/'))
-                    .resolve(className + ".java");
+                    .resolve(runnerClassName + ".java");
             Files.createDirectories(p.getParent());
             Files.write(p, runner.getBytes(StandardCharsets.UTF_8));
             written.add(p);
